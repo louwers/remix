@@ -1,0 +1,1 @@
+{"version":3,"file":"tsconfig.d.ts","sourceRoot":"","sources":["../../src/lib/tsconfig.ts"],"names":[],"mappings":"AAKA,MAAM,WAAW,wBAAwB;IACvC,QAAQ,EAAE,MAAM,CAAA;IAChB,WAAW,CAAC,EAAE;QAAE,eAAe,EAAE,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CAAA;KAAE,CAAA;CAC3D;AAWD,eAAO,IAAI,iBAAiB,QAAa,CAAA;AAEzC,wBAAgB,2BAA2B,CAAC,QAAQ,EAAE,MAAM,GAAG,wBAAwB,CAmCtF"}

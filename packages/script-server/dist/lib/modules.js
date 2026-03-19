@@ -1,0 +1,672 @@
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as esbuild from 'esbuild';
+import { createMemoryFileStorage } from '@remix-run/file-storage/memory';
+import { init as lexerInit, parse as parseImports } from 'es-module-lexer';
+import MagicString from 'magic-string';
+import { isCommonJS, mayContainCommonJSModuleGlobals } from "./cjs-check.js";
+import { generateETag, matchesETag } from "./etag.js";
+import { hashContent } from "./hash.js";
+import { getTsconfigTransformOptions } from "./tsconfig.js";
+let lexerReady = lexerInit;
+let preloadTraversalConcurrency = getPreloadTraversalConcurrency();
+export function createModuleCompiler(options) {
+    let dependencyRecords = new Map();
+    let dependencyInFlight = new Map();
+    let compiledAssets = new Map();
+    let compileInFlight = new Map();
+    let resolvedPathsByIdentity = new Map();
+    let cacheNamespace = options.buildId === undefined ? 'live' : encodeURIComponent(options.buildId);
+    let fileStorage = options.fileStorage ?? createMemoryFileStorage();
+    let buildIsImmutable = options.buildId !== undefined;
+    return {
+        async compileModule(absolutePath) {
+            let resolved = resolveModulePath(absolutePath);
+            if (!resolved) {
+                throw Object.assign(new Error(`Module not found: ${absolutePath}`), { code: 'ENOENT' });
+            }
+            if (!options.isAllowed(resolved.identityPath)) {
+                throw Object.assign(new Error(`Module is not allowed: ${resolved.identityPath}`), {
+                    code: 'ENOENT',
+                });
+            }
+            let existing = compileInFlight.get(resolved.identityPath);
+            if (existing)
+                return existing;
+            let promise = compileModuleResolved(resolved);
+            compileInFlight.set(resolved.identityPath, promise);
+            try {
+                return await promise;
+            }
+            finally {
+                compileInFlight.delete(resolved.identityPath);
+            }
+        },
+        async getPreloadUrls(moduleUrl) {
+            let resolved = resolveEntryFromUrl(moduleUrl);
+            if (!resolved) {
+                throw new Error(`Module "${moduleUrl}" is outside all configured routes.`);
+            }
+            let visited = new Set([resolved.identityPath]);
+            let queue = [resolved.identityPath];
+            let urls = [];
+            while (queue.length > 0) {
+                let frontier = queue;
+                queue = [];
+                let preparedRecords = await mapWithConcurrency(frontier, preloadTraversalConcurrency, (identityPath) => prepareDependencyRecord(identityPath));
+                let records = await finalizePreparedDependencyRecords(preparedRecords);
+                for (let record of records) {
+                    urls.push(getServedUrlFromRecord(record));
+                    for (let dep of record.deps) {
+                        if (visited.has(dep))
+                            continue;
+                        visited.add(dep);
+                        queue.push(dep);
+                    }
+                }
+            }
+            return urls;
+        },
+        resolveRequestPath(absolutePath) {
+            return resolveModulePath(absolutePath);
+        },
+    };
+    async function compileModuleResolved(resolved) {
+        let record = await getDependencyRecordByIdentity(resolved.identityPath, resolved.resolvedPath);
+        let cacheKey = await getCompiledAssetKey(record.identityPath);
+        let existing = compiledAssets.get(record.identityPath);
+        if (existing && buildIsImmutable) {
+            return toModuleCompileResult(record, existing);
+        }
+        let stored = await readCompiledAsset(cacheKey);
+        if (stored && buildIsImmutable) {
+            compiledAssets.set(record.identityPath, stored);
+            return toModuleCompileResult(record, stored);
+        }
+        let directImportUrls = await Promise.all(record.deps.map((depPath) => getServedUrl(depPath)));
+        let directImportHash = await hashContent(JSON.stringify(directImportUrls));
+        if (existing &&
+            existing.sourceStamp === record.sourceStamp &&
+            existing.directImportHash === directImportHash) {
+            return toModuleCompileResult(record, existing);
+        }
+        if (stored &&
+            stored.sourceStamp === record.sourceStamp &&
+            stored.directImportHash === directImportHash) {
+            compiledAssets.set(record.identityPath, stored);
+            return toModuleCompileResult(record, stored);
+        }
+        let compiledCode = await rewriteImports(record);
+        let finalCode = compiledCode;
+        if (record.sourcemap) {
+            if (options.sourceMaps === 'inline') {
+                let encoded = Buffer.from(record.sourcemap).toString('base64');
+                finalCode += `\n//# sourceMappingURL=data:application/json;base64,${encoded}`;
+            }
+            else if (options.sourceMaps === 'external') {
+                let mapPath = options.isEntryPoint(record.identityPath)
+                    ? `${record.stableUrlPathname}.map`
+                    : options.fingerprintInternalModules
+                        ? `${record.stableUrlPathname}.@${record.fingerprint}.map`
+                        : `${record.stableUrlPathname}.map`;
+                finalCode += `\n//# sourceMappingURL=${mapPath}`;
+            }
+        }
+        let compiledHash = await hashContent(finalCode);
+        let sourcemapHash = record.sourcemap ? await hashContent(record.sourcemap) : null;
+        let asset = {
+            compiledCode: finalCode,
+            compiledHash,
+            directImportHash,
+            sourceStamp: record.sourceStamp,
+            sourcemap: record.sourcemap,
+            sourcemapHash,
+        };
+        compiledAssets.set(record.identityPath, asset);
+        await writeCompiledAsset(cacheKey, asset);
+        return toModuleCompileResult(record, asset);
+    }
+    async function rewriteImports(record) {
+        let output = new MagicString(record.rawCode);
+        for (let imported of record.imports) {
+            let url = await getServedUrl(imported.depPath);
+            output.overwrite(imported.start, imported.end, url);
+        }
+        return output.toString();
+    }
+    async function getServedUrl(identityPath) {
+        let record = await getDependencyRecordByIdentity(identityPath);
+        return getServedUrlFromRecord(record);
+    }
+    function getServedUrlFromRecord(record) {
+        if (options.isEntryPoint(record.identityPath) || !options.fingerprintInternalModules) {
+            return record.stableUrlPathname;
+        }
+        return `${record.stableUrlPathname}.@${record.fingerprint}`;
+    }
+    async function getDependencyRecordFromPath(absolutePath) {
+        let resolved = resolveModulePath(absolutePath);
+        if (!resolved) {
+            throw Object.assign(new Error(`Module not found: ${absolutePath}`), { code: 'ENOENT' });
+        }
+        return getDependencyRecordByIdentity(resolved.identityPath, resolved.resolvedPath);
+    }
+    async function getDependencyRecordByIdentity(identityPath, resolvedPath) {
+        let existing = dependencyInFlight.get(identityPath);
+        if (existing)
+            return existing;
+        let promise = loadDependencyRecord(identityPath, resolvedPath);
+        dependencyInFlight.set(identityPath, promise);
+        try {
+            return await promise;
+        }
+        finally {
+            dependencyInFlight.delete(identityPath);
+        }
+    }
+    async function loadDependencyRecord(identityPath, resolvedPath) {
+        let prepared = await prepareDependencyRecord(identityPath, resolvedPath);
+        return finalizePreparedDependencyRecord(prepared);
+    }
+    async function prepareDependencyRecord(identityPath, resolvedPath) {
+        let cached = dependencyRecords.get(identityPath);
+        if (cached && buildIsImmutable) {
+            return cached;
+        }
+        let cacheKey = await getDependencyRecordKey(identityPath);
+        if (buildIsImmutable) {
+            let stored = await readDependencyRecord(cacheKey);
+            if (stored) {
+                let record = {
+                    deps: stored.deps,
+                    fingerprint: stored.fingerprint,
+                    identityPath,
+                    imports: stored.imports,
+                    rawCode: stored.rawCode,
+                    resolvedPath: stored.resolvedPath,
+                    sourceMapHash: stored.sourceMapHash,
+                    sourceStamp: stored.sourceStamp,
+                    sourcemap: stored.sourcemap,
+                    stableUrlPathname: stored.stableUrlPathname,
+                    transformConfigHash: stored.transformConfigHash,
+                };
+                resolvedPathsByIdentity.set(identityPath, stored.resolvedPath);
+                dependencyRecords.set(identityPath, record);
+                return record;
+            }
+        }
+        let nextResolvedPath = resolvedPath ?? resolvedPathsByIdentity.get(identityPath) ?? resolveActualPath(identityPath);
+        if (!nextResolvedPath) {
+            throw Object.assign(new Error(`Module not found: ${identityPath}`), { code: 'ENOENT' });
+        }
+        let stat = await fsp.stat(nextResolvedPath);
+        let sourceStamp = sourceStampFromStat(stat);
+        let transformOptions = getTsconfigTransformOptions(nextResolvedPath);
+        let transformConfigHash = await hashContent(transformOptions.cacheKey);
+        if (cached &&
+            cached.sourceStamp === sourceStamp &&
+            cached.resolvedPath === nextResolvedPath &&
+            cached.transformConfigHash === transformConfigHash) {
+            return cached;
+        }
+        let stored = await readDependencyRecord(cacheKey);
+        if (stored &&
+            stored.sourceStamp === sourceStamp &&
+            stored.resolvedPath === nextResolvedPath &&
+            stored.transformConfigHash === transformConfigHash) {
+            let record = {
+                deps: stored.deps,
+                fingerprint: stored.fingerprint,
+                identityPath,
+                imports: stored.imports,
+                rawCode: stored.rawCode,
+                resolvedPath: stored.resolvedPath,
+                sourceMapHash: stored.sourceMapHash,
+                sourceStamp: stored.sourceStamp,
+                sourcemap: stored.sourcemap,
+                stableUrlPathname: stored.stableUrlPathname,
+                transformConfigHash: stored.transformConfigHash,
+            };
+            resolvedPathsByIdentity.set(identityPath, nextResolvedPath);
+            dependencyRecords.set(identityPath, record);
+            return record;
+        }
+        let sourceText = await fsp.readFile(nextResolvedPath, 'utf-8');
+        let mayContainCommonJS = mayContainCommonJSModuleGlobals(sourceText);
+        let analysis = await analyzeModuleSource(sourceText, nextResolvedPath, transformOptions, {
+            minify: options.minify,
+            sourceMaps: options.sourceMaps,
+        });
+        analysis.unresolvedImports = analysis.unresolvedImports.filter((unresolved) => !options.external.includes(unresolved.specifier));
+        if (mayContainCommonJS && isCommonJS(analysis.rawCode)) {
+            throw new Error(getCommonJsModuleErrorMessage(nextResolvedPath));
+        }
+        let stableUrlPathname = options.routes.toUrlPathname(identityPath);
+        if (!stableUrlPathname) {
+            throw new Error(`Module ${identityPath} is outside all configured routes.`);
+        }
+        let sourcemap = analysis.sourcemap
+            ? rewriteSourceMap(analysis.sourcemap, nextResolvedPath, stableUrlPathname)
+            : null;
+        let fingerprint = await hashContent(sourceText + '\0' + (options.buildId ?? ''));
+        return {
+            fingerprint,
+            identityPath,
+            importerDir: path.dirname(nextResolvedPath),
+            rawCode: analysis.rawCode,
+            resolvedPath: nextResolvedPath,
+            sourceMapHash: sourcemap ? await hashContent(sourcemap) : analysis.sourceMapHash,
+            sourceStamp,
+            sourcemap,
+            stableUrlPathname,
+            transformConfigHash,
+            unresolvedImports: analysis.unresolvedImports,
+        };
+    }
+    async function finalizePreparedDependencyRecord(prepared) {
+        if (isDependencyRecord(prepared))
+            return prepared;
+        let resolvedImports = prepared.unresolvedImports.length > 0
+            ? await batchResolveSpecifiers(getUniqueSpecifiers(prepared.unresolvedImports), prepared.importerDir)
+            : new Map();
+        return finalizeDependencyRecord(prepared, resolvedImports);
+    }
+    async function finalizePreparedDependencyRecords(preparedRecords) {
+        let groupedSpecifiers = new Map();
+        for (let prepared of preparedRecords) {
+            if (isDependencyRecord(prepared) || prepared.unresolvedImports.length === 0)
+                continue;
+            let existing = groupedSpecifiers.get(prepared.importerDir) ?? new Set();
+            for (let specifier of getUniqueSpecifiers(prepared.unresolvedImports)) {
+                existing.add(specifier);
+            }
+            groupedSpecifiers.set(prepared.importerDir, existing);
+        }
+        let resolvedByDirectory = new Map();
+        await mapWithConcurrency([...groupedSpecifiers.entries()], preloadTraversalConcurrency, async ([importerDir, specifiers]) => {
+            resolvedByDirectory.set(importerDir, await batchResolveSpecifiers([...specifiers], importerDir));
+        });
+        return Promise.all(preparedRecords.map((prepared) => {
+            if (isDependencyRecord(prepared))
+                return prepared;
+            return finalizeDependencyRecord(prepared, resolvedByDirectory.get(prepared.importerDir) ?? new Map());
+        }));
+    }
+    async function finalizeDependencyRecord(prepared, resolvedImports) {
+        let importsWithPaths = [];
+        let deps = new Set();
+        for (let unresolved of prepared.unresolvedImports) {
+            let resolvedImportPath = resolvedImports.get(unresolved.specifier);
+            if (!resolvedImportPath) {
+                throw new Error(getUnresolvedImportErrorMessage(prepared.resolvedPath, unresolved.specifier));
+            }
+            let resolvedImport = resolveModulePath(resolvedImportPath);
+            if (!resolvedImport) {
+                throw new Error(getUnsupportedImportErrorMessage(prepared.resolvedPath, unresolved.specifier));
+            }
+            if (!options.isAllowed(resolvedImport.identityPath)) {
+                throw new Error(getUnconfiguredImportErrorMessage(prepared.resolvedPath, unresolved.specifier));
+            }
+            let stableUrlPathname = options.routes.toUrlPathname(resolvedImport.identityPath);
+            if (!stableUrlPathname) {
+                throw new Error(getUnconfiguredImportErrorMessage(prepared.resolvedPath, unresolved.specifier));
+            }
+            deps.add(resolvedImport.identityPath);
+            importsWithPaths.push({
+                depPath: resolvedImport.identityPath,
+                end: unresolved.end,
+                start: unresolved.start,
+            });
+        }
+        let record = {
+            deps: [...deps],
+            fingerprint: prepared.fingerprint,
+            identityPath: prepared.identityPath,
+            imports: importsWithPaths,
+            rawCode: prepared.rawCode,
+            resolvedPath: prepared.resolvedPath,
+            sourceMapHash: prepared.sourceMapHash,
+            sourceStamp: prepared.sourceStamp,
+            sourcemap: prepared.sourcemap,
+            stableUrlPathname: prepared.stableUrlPathname,
+            transformConfigHash: prepared.transformConfigHash,
+        };
+        resolvedPathsByIdentity.set(prepared.identityPath, prepared.resolvedPath);
+        dependencyRecords.set(prepared.identityPath, record);
+        await writeDependencyRecordForRecord(record);
+        return record;
+    }
+    function isDependencyRecord(value) {
+        return 'deps' in value;
+    }
+    function rewriteSourceMap(sourcemap, resolvedPath, stableUrlPathname) {
+        try {
+            let json = JSON.parse(sourcemap);
+            json.sources = [
+                options.sourceMapSourcePaths === 'absolute'
+                    ? stripWindowsDriveSlash(resolvedPath)
+                    : stableUrlPathname,
+            ];
+            return JSON.stringify(json);
+        }
+        catch {
+            return sourcemap;
+        }
+    }
+    async function getCompiledAssetKey(identityPath) {
+        return `compiled/${cacheNamespace}/${await hashContent(identityPath)}.json`;
+    }
+    async function getDependencyRecordKey(identityPath) {
+        return `dependency-records/${cacheNamespace}/${await hashContent(identityPath)}.json`;
+    }
+    async function readCompiledAsset(key) {
+        let file = await fileStorage.get(key);
+        if (!file)
+            return null;
+        return JSON.parse(await file.text());
+    }
+    async function readDependencyRecord(key) {
+        let file = await fileStorage.get(key);
+        if (!file)
+            return null;
+        return JSON.parse(await file.text());
+    }
+    async function writeCompiledAsset(key, record) {
+        await fileStorage.set(key, new File([JSON.stringify(record)], 'compiled-asset.json', {
+            type: 'application/json',
+        }));
+    }
+    async function writeDependencyRecordForRecord(record) {
+        let key = await getDependencyRecordKey(record.identityPath);
+        let cachedRecord = {
+            deps: record.deps,
+            fingerprint: record.fingerprint,
+            imports: record.imports,
+            rawCode: record.rawCode,
+            resolvedPath: record.resolvedPath,
+            sourceMapHash: record.sourceMapHash,
+            sourceStamp: record.sourceStamp,
+            sourcemap: record.sourcemap,
+            stableUrlPathname: record.stableUrlPathname,
+            transformConfigHash: record.transformConfigHash,
+        };
+        await fileStorage.set(key, new File([JSON.stringify(cachedRecord)], 'dependency-record.json', {
+            type: 'application/json',
+        }));
+    }
+    function toModuleCompileResult(record, asset) {
+        return {
+            compiledCode: asset.compiledCode,
+            compiledHash: asset.compiledHash,
+            deps: record.deps,
+            fingerprint: record.fingerprint,
+            sourcemap: asset.sourcemap,
+            sourcemapHash: asset.sourcemapHash,
+            stableUrlPathname: record.stableUrlPathname,
+        };
+    }
+    function resolveEntryFromUrl(entryUrl) {
+        let pathname = entryUrl;
+        try {
+            pathname = new URL(entryUrl).pathname;
+        }
+        catch {
+            pathname = entryUrl;
+        }
+        let resolvedPath = options.routes.resolveUrlPathname(pathname);
+        if (!resolvedPath)
+            return null;
+        return resolveModulePath(resolvedPath);
+    }
+}
+export function resolveModulePath(absolutePath) {
+    let resolvedPath;
+    try {
+        resolvedPath = fs.realpathSync(resolveFileSystemPath(absolutePath));
+    }
+    catch (error) {
+        if (isNoEntityError(error))
+            return null;
+        throw error;
+    }
+    if (!isSupportedScriptPath(resolvedPath)) {
+        return null;
+    }
+    return {
+        identityPath: normalizeActualFilePath(resolvedPath),
+        resolvedPath,
+    };
+}
+function resolveActualPath(identityPath) {
+    let actualPath = resolveFileSystemPath(identityPath);
+    try {
+        return fs.realpathSync(actualPath);
+    }
+    catch (error) {
+        if (isNoEntityError(error))
+            return null;
+        throw error;
+    }
+}
+function normalizeActualFilePath(filePath) {
+    let normalizedInput = filePath.replace(/\\/g, '/');
+    if (/^\/[A-Za-z]:\//.test(normalizedInput)) {
+        return normalizedInput;
+    }
+    if (/^[A-Za-z]:\//.test(normalizedInput)) {
+        return `/${normalizedInput}`;
+    }
+    let normalized = path.resolve(filePath).replace(/\\/g, '/');
+    if (/^[A-Za-z]:\//.test(normalized)) {
+        return `/${normalized}`;
+    }
+    return normalized;
+}
+function isSupportedScriptPath(filePath) {
+    switch (path.extname(filePath).toLowerCase()) {
+        case '.js':
+        case '.jsx':
+        case '.mjs':
+        case '.mts':
+        case '.ts':
+        case '.tsx':
+            return true;
+        default:
+            return false;
+    }
+}
+function stripWindowsDriveSlash(filePath) {
+    return /^\/[A-Za-z]:\//.test(filePath) ? filePath.slice(1) : filePath;
+}
+function resolveFileSystemPath(filePath) {
+    let normalizedInput = stripWindowsDriveSlash(filePath).replace(/\\/g, '/');
+    if (/^[A-Za-z]:\//.test(normalizedInput)) {
+        return normalizedInput;
+    }
+    return path.resolve(normalizedInput);
+}
+function sourceStampFromStat(stat) {
+    return `${stat.size}:${stat.mtimeMs}`;
+}
+async function analyzeModuleSource(sourceText, resolvedPath, transformOptions, options) {
+    let transformResult = await esbuild.transform(sourceText, {
+        format: 'esm',
+        loader: getTransformLoader(resolvedPath),
+        logLevel: 'silent',
+        minify: options.minify,
+        sourcefile: resolvedPath,
+        sourcemap: options.sourceMaps ? 'external' : false,
+        tsconfigRaw: transformOptions.tsconfigRaw,
+    });
+    let rawCode = transformResult.code.replace(/^\/\/# sourceMappingURL=.+$/m, '').trimEnd();
+    let sourcemap = transformResult.map ?? null;
+    await lexerReady;
+    let unresolvedImports = getUnresolvedImportsFromCode(rawCode);
+    return {
+        rawCode,
+        sourceMapHash: sourcemap ? await hashContent(sourcemap) : '',
+        sourcemap,
+        unresolvedImports,
+    };
+}
+function getTransformLoader(resolvedPath) {
+    switch (path.extname(resolvedPath).toLowerCase()) {
+        case '.jsx':
+            return 'jsx';
+        case '.mjs':
+            return 'js';
+        case '.mts':
+            return 'ts';
+        case '.tsx':
+            return 'tsx';
+        case '.ts':
+            return 'ts';
+        default:
+            return 'js';
+    }
+}
+async function batchResolveSpecifiers(specifiers, importerDir) {
+    let results = new Map();
+    if (specifiers.length === 0)
+        return results;
+    let resolved = await resolveWithEsbuild(specifiers, importerDir);
+    for (let match of resolved) {
+        if (match.absolutePath) {
+            results.set(match.specifier, normalizeActualFilePath(match.absolutePath));
+        }
+    }
+    return results;
+}
+function getPreloadTraversalConcurrency() {
+    let override = process.env.SCRIPT_SERVER_PRELOAD_CONCURRENCY;
+    if (override !== undefined) {
+        let parsed = Number.parseInt(override, 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+            return parsed;
+        }
+    }
+    return Math.max(1, Math.min(8, os.availableParallelism() - 1));
+}
+function getUniqueSpecifiers(unresolvedImports) {
+    return [...new Set(unresolvedImports.map((unresolved) => unresolved.specifier))];
+}
+function getUnresolvedImportsFromCode(rawCode) {
+    let [imports] = parseImports(rawCode);
+    let unresolvedImports = [];
+    for (let imported of imports) {
+        if (imported.n == null)
+            continue;
+        let specifier = imported.n;
+        if (specifier.startsWith('data:') ||
+            specifier.startsWith('http://') ||
+            specifier.startsWith('https://')) {
+            continue;
+        }
+        unresolvedImports.push({ specifier, start: imported.s, end: imported.e });
+    }
+    return unresolvedImports;
+}
+async function mapWithConcurrency(items, concurrency, mapper) {
+    if (items.length === 0)
+        return [];
+    let results = new Array(items.length);
+    let nextIndex = 0;
+    async function worker() {
+        while (nextIndex < items.length) {
+            let index = nextIndex++;
+            results[index] = await mapper(items[index], index);
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+    return results;
+}
+async function resolveWithEsbuild(specifiers, importerDir) {
+    let resolved = [];
+    await esbuild.build({
+        stdin: { contents: '', loader: 'js', resolveDir: importerDir },
+        write: false,
+        bundle: true,
+        platform: 'browser',
+        format: 'esm',
+        logLevel: 'silent',
+        plugins: [
+            {
+                name: 'batch-resolver',
+                setup(build) {
+                    build.onStart(async () => {
+                        let results = await Promise.all(specifiers.map((specifier) => build.resolve(specifier, {
+                            kind: 'import-statement',
+                            resolveDir: importerDir,
+                        })));
+                        for (let index = 0; index < specifiers.length; index++) {
+                            let result = results[index];
+                            if (result?.errors.length) {
+                                throw new Error(getUnresolvedImportErrorMessage(importerDir, specifiers[index]));
+                            }
+                            let absolutePath = result && !result.external && result.path && path.isAbsolute(result.path)
+                                ? result.path
+                                : null;
+                            resolved.push({ absolutePath, specifier: specifiers[index] });
+                        }
+                    });
+                    build.onResolve({ filter: /.*/ }, (args) => {
+                        if (args.importer)
+                            return { external: true };
+                        return undefined;
+                    });
+                },
+            },
+        ],
+    });
+    return resolved;
+}
+function getCommonJsModuleErrorMessage(absolutePath) {
+    return (`CommonJS module detected: ${absolutePath}\n\n` +
+        `This module uses CommonJS (require/module.exports) which is not supported.\n` +
+        `Please use an ESM-compatible module.`);
+}
+function getUnconfiguredImportErrorMessage(importerPath, specifier) {
+    return (`Resolved import "${specifier}" in ${importerPath} points outside the script-server routing/allow configuration.\n\n` +
+        `Add a matching route and allow rule, or mark this import as external.`);
+}
+function getUnresolvedImportErrorMessage(importerPath, specifier) {
+    return (`Failed to resolve import "${specifier}" in ${importerPath}.\n\n` +
+        `Ensure it resolves to a file within the configured script-server routes, or mark it as external.`);
+}
+function getUnsupportedImportErrorMessage(importerPath, specifier) {
+    return (`Resolved import "${specifier}" in ${importerPath} is not a supported script module.\n\n` +
+        `Supported extensions are .js, .jsx, .mjs, .mts, .ts, and .tsx.`);
+}
+function isNoEntityError(error) {
+    return (error instanceof Error && 'code' in error && error.code === 'ENOENT');
+}
+export function createResponseForModule(result, options) {
+    let body;
+    let etag;
+    let contentType;
+    if (options.isSourceMapRequest) {
+        if (!result.sourcemap) {
+            return new Response('Not found', { status: 404 });
+        }
+        body = options.method === 'HEAD' ? null : result.sourcemap;
+        etag = generateETag(result.sourcemapHash ?? result.compiledHash);
+        contentType = 'application/json; charset=utf-8';
+    }
+    else {
+        body = options.method === 'HEAD' ? null : result.compiledCode;
+        etag = generateETag(result.compiledHash);
+        contentType = 'application/javascript; charset=utf-8';
+    }
+    if (matchesETag(options.ifNoneMatch, etag)) {
+        return new Response(null, { status: 304, headers: { ETag: etag } });
+    }
+    return new Response(body, {
+        headers: {
+            'Cache-Control': options.cacheControl,
+            'Content-Type': contentType,
+            ETag: etag,
+        },
+    });
+}

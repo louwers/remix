@@ -19,22 +19,16 @@
   ],
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
     "./package.json": "./package.json"
   },
-  "publishConfig": {
-    "exports": {
-      ".": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "./package.json": "./package.json"
-    }
-  },
   "dependencies": {
-    "@remix-run/file-storage": "workspace:*",
-    "@remix-run/headers": "workspace:*",
-    "@remix-run/route-pattern": "workspace:*",
+    "@remix-run/file-storage": "remix-run/remix#preview/pr-11149&path:packages/file-storage",
+    "@remix-run/headers": "remix-run/remix#preview/pr-11149&path:packages/headers",
+    "@remix-run/route-pattern": "remix-run/remix#preview/pr-11149&path:packages/route-pattern",
     "@swc/core": "^1.15.18",
     "es-module-lexer": "^2.0.0",
     "esbuild": "^0.25.0",
